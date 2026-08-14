@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `drag` now performs a real pointer gesture, so it drives JS drag libraries
+  (dnd-kit, sortable.js, interact.js, react-dnd's mouse backend) instead of only
+  HTML5 `draggable="true"` handlers. Previously it dispatched HTML5 DragEvents
+  plus a single `mousedown` — no `mousemove` stream and no `mouseup` — which those
+  libraries cannot activate on, while still returning `ok: true`. A drag against a
+  dnd-kit app therefore reported success and did nothing, which is the worst
+  outcome for an agent asserting on it. The gesture now presses the deepest node
+  under the start point (library listeners commonly sit on an inner handle, and
+  events only bubble upward), streams interpolated `mousemove`/`pointermove`
+  events on `document` to clear distance thresholds, emits the HTML5 sequence as
+  before, and releases with `mouseup`/`pointerup`. `steps`, `stepDelayMs` and
+  `settleMs` params tune it; the result echoes `from`/`to`/`steps` and adds
+  `html5DropHandled` so a caller can see whether a native handler claimed the
+  drop. `ok` still means only that the gesture was delivered — assert the effect.
+
 ### Security
 
 - Upgrade the docs site to Astro 7.1.5 (from 6.3.2), Starlight 0.41.5 and sharp
