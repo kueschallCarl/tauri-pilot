@@ -65,10 +65,10 @@ fn bridge_eval_timeout(params: Option<&serde_json::Value>) -> Duration {
 /// and the pending result is dropped.
 fn drag_eval_timeout(params: Option<&serde_json::Value>) -> Duration {
     // Values `bridge.js` itself rejects (NaN, negative) fall back to its own
-    // default here too, as do the shapes `Number()` maps to 0 where Rust
-    // doesn't (`null`, `true`, `""`). Those last ones over-estimate the
-    // budget, which costs nothing but headroom the caller never pays unless
-    // JS is genuinely stuck.
+    // default here too. The shapes `Number()` accepts and Rust doesn't —
+    // `null` and `""` give 0, `true` gives 1 — land on a default larger than
+    // what the bridge computes, so they over-estimate the budget. That costs
+    // nothing but headroom the caller never pays unless JS is genuinely stuck.
     let field = |key: &str, default: f64| {
         params
             .and_then(|p| p.get(key))
@@ -95,13 +95,25 @@ fn drag_eval_timeout(params: Option<&serde_json::Value>) -> Duration {
 
 /// Mirror the `Number()` coercion `bridge.js` applies to each drag tunable
 /// before validating it. A numeric string is a real value over there
-/// (`Number("1000")` is `1000`), so reading one as "absent" here would
-/// under-budget the gesture by three orders of magnitude.
+/// (`Number("1000")` is `1000`, and so is `Number("0x3e8")`), so reading one
+/// as "absent" here would under-budget the gesture by three orders of
+/// magnitude.
 fn coerce_number(value: &serde_json::Value) -> Option<f64> {
-    match value {
-        serde_json::Value::String(s) => s.trim().parse().ok(),
-        other => other.as_f64(),
+    let serde_json::Value::String(text) = value else {
+        return value.as_f64();
+    };
+    let text = text.trim();
+    // Radix-prefixed integer literals are the one string form `Number()`
+    // accepts and `f64::from_str` rejects. Capped at `u32` because
+    // `setTimeout` fires immediately past its own 32-bit delay limit, so a
+    // larger literal describes a wait no browser performs anyway.
+    let lowered = text.to_ascii_lowercase();
+    for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
+        if let Some(digits) = lowered.strip_prefix(prefix) {
+            return u32::from_str_radix(digits, radix).ok().map(f64::from);
+        }
     }
+    text.parse().ok()
 }
 
 /// Extract and remove the optional `"window"` key from params.
@@ -1477,6 +1489,19 @@ mod tests {
         assert_eq!(
             got,
             Duration::from_millis(60 * 1_000 + 500 + BRIDGE_TIMEOUT_BUFFER_MS)
+        );
+    }
+
+    #[test]
+    fn test_drag_eval_timeout_coerces_radix_prefixed_strings() {
+        // `Number("0x3e8")` is 1000, so the bridge really does wait a second
+        // between moves here. Rejecting the literal would put the channel back
+        // on its 10 s floor against a 60 s gesture.
+        let params = json!({"steps": "0x3c", "stepDelayMs": "0X3E8", "settleMs": "0b0"});
+        let got = drag_eval_timeout(Some(&params));
+        assert_eq!(
+            got,
+            Duration::from_millis(60 * 1_000 + BRIDGE_TIMEOUT_BUFFER_MS)
         );
     }
 
