@@ -104,13 +104,22 @@ fn coerce_number(value: &serde_json::Value) -> Option<f64> {
     };
     let text = text.trim();
     // Radix-prefixed integer literals are the one string form `Number()`
-    // accepts and `f64::from_str` rejects. Capped at `u32` because
-    // `setTimeout` fires immediately past its own 32-bit delay limit, so a
-    // larger literal describes a wait no browser performs anyway.
+    // accepts and `f64::from_str` rejects. Accumulated in `f64` rather than an
+    // integer type because `Number()` puts no width limit on them and `steps`
+    // clamps to 60 afterwards, so a capped parse would send a huge count back
+    // to the default of 12 instead of to the clamp.
     let lowered = text.to_ascii_lowercase();
-    for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
+    for (prefix, radix) in [("0x", 16_u32), ("0o", 8), ("0b", 2)] {
         if let Some(digits) = lowered.strip_prefix(prefix) {
-            return u32::from_str_radix(digits, radix).ok().map(f64::from);
+            // `Number("0x")` is NaN, and `try_fold` would call it 0.
+            if digits.is_empty() {
+                return None;
+            }
+            return digits.chars().try_fold(0.0_f64, |acc, digit| {
+                digit
+                    .to_digit(radix)
+                    .map(|d| acc.mul_add(f64::from(radix), f64::from(d)))
+            });
         }
     }
     text.parse().ok()
@@ -1503,6 +1512,27 @@ mod tests {
             got,
             Duration::from_millis(60 * 1_000 + BRIDGE_TIMEOUT_BUFFER_MS)
         );
+    }
+
+    #[test]
+    fn test_drag_eval_timeout_clamps_a_wide_radix_step_count() {
+        // A literal past any integer width still floors to the bridge's 60-step
+        // clamp, not back to its default of 12 — the difference is 60 s of
+        // gesture against a 12 s budget.
+        let params = json!({"steps": "0xFFFFFFFFFF", "stepDelayMs": 1_000, "settleMs": 0});
+        let got = drag_eval_timeout(Some(&params));
+        assert_eq!(
+            got,
+            Duration::from_millis(60 * 1_000 + BRIDGE_TIMEOUT_BUFFER_MS)
+        );
+    }
+
+    #[test]
+    fn test_drag_eval_timeout_rejects_a_bare_radix_prefix() {
+        // `Number("0x")` is NaN, so the bridge uses its default and so must the
+        // budget.
+        let params = json!({"steps": "0x", "stepDelayMs": "0b2", "settleMs": 0});
+        assert_eq!(drag_eval_timeout(Some(&params)), DEFAULT_TIMEOUT);
     }
 
     #[test]
