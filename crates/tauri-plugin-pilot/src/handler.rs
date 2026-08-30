@@ -73,7 +73,13 @@ fn drag_eval_timeout(params: Option<&serde_json::Value>) -> Duration {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(default)
     };
-    let steps = field("steps", 12).clamp(1, 60);
+    // `bridge.js` sends anything below 1 back to its default of 12, so a
+    // clamp to 1 here would under-budget a `steps: 0` call by an order of
+    // magnitude.
+    let steps = match field("steps", 12) {
+        0 => 12,
+        steps => steps.min(60),
+    };
     let gesture_ms = steps
         .saturating_mul(field("stepDelayMs", 16))
         .saturating_add(field("settleMs", 250))
@@ -1429,6 +1435,18 @@ mod tests {
         assert_eq!(
             got,
             Duration::from_millis(60 * 1_000 + BRIDGE_TIMEOUT_BUFFER_MS)
+        );
+    }
+
+    #[test]
+    fn test_drag_eval_timeout_treats_zero_steps_as_the_bridge_default() {
+        // `bridge.js` maps steps < 1 to 12, so zero is 12 s of move delays here,
+        // not one. Clamping to 1 would expire the channel mid-gesture.
+        let params = json!({"steps": 0, "stepDelayMs": 1_000, "settleMs": 0});
+        let got = drag_eval_timeout(Some(&params));
+        assert_eq!(
+            got,
+            Duration::from_millis(12 * 1_000 + BRIDGE_TIMEOUT_BUFFER_MS)
         );
     }
 

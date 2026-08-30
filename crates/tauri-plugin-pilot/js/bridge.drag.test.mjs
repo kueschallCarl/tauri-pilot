@@ -513,18 +513,29 @@ test("drag does not pay a step delay after the last move", async () => {
   const target = makeElement(rect(200, 200, 100, 100));
   const { pilot } = loadBridge({ elements: { "#a": source, "#b": target } });
 
-  const started = Date.now();
-  await pilot.drag({
-    source: { selector: "#a" },
-    target: { selector: "#b" },
-    steps: 3,
-    stepDelayMs: 100,
-    settleMs: 0,
-  });
-  const elapsed = Date.now() - started;
+  // Record what the gesture schedules rather than how long it takes. A wall
+  // clock has no upper bound: a paused event loop would fail a correct run.
+  const realSetTimeout = globalThis.setTimeout;
+  const delays = [];
+  globalThis.setTimeout = (fn, ms) => {
+    delays.push(ms);
+    return realSetTimeout(fn, 0);
+  };
+  try {
+    await pilot.drag({
+      source: { selector: "#a" },
+      target: { selector: "#b" },
+      steps: 3,
+      stepDelayMs: 100,
+      settleMs: 40,
+    });
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
 
-  assert.ok(elapsed >= 200, `three moves need two gaps, got ${elapsed}ms`);
-  assert.ok(elapsed < 300, `a fourth gap was paid after the last move (${elapsed}ms)`);
+  // Two gaps for three moves, then the settle. A third 100 would mean the loop
+  // slept after the last move.
+  assert.deepEqual(delays, [100, 100, 40]);
 });
 
 test("drag waits between moves and settles after the release by default", async () => {
