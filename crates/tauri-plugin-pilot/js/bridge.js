@@ -638,30 +638,28 @@
     return { ok: true };
   }
 
-  // Dispatch a mouse/pointer pair. Older WebViews without PointerEvent still get
-  // the MouseEvent, so a missing constructor degrades instead of throwing.
-  function dispatchPointerPair(node, mouseType, pointerType, x, y, buttons) {
-    var init = {
-      clientX: x,
-      clientY: y,
+  // A pointer event followed by the compatibility mouse event a browser would
+  // synthesise from it — same order and same preventDefault gate as `click()`,
+  // since a cancelled pointer event suppresses its mouse counterpart. Goes
+  // through `dispatchPointerEvent`, so a WebView without the `PointerEvent`
+  // constructor still gets a pointer-typed event (a MouseEvent with
+  // pointerId/pointerType patched on) rather than nothing at all — dnd-kit's
+  // default sensor is `PointerSensor`, so that fallback is the whole point.
+  function dispatchGesturePair(node, pointerType, mouseType, x, y, buttons) {
+    var init = { clientX: x, clientY: y, buttons: buttons, view: window };
+    if (!dispatchPointerEvent(node, pointerType, init)) return false;
+    return node.dispatchEvent(new MouseEvent(mouseType, Object.assign({
       bubbles: true,
       cancelable: true,
+      composed: true,
       button: 0,
-      buttons: buttons,
-      view: typeof window === "undefined" ? undefined : window,
-    };
-    var accepted = node.dispatchEvent(new MouseEvent(mouseType, init));
-    if (pointerType && typeof PointerEvent === "function") {
-      var pointerInit = {};
-      for (var key in init) {
-        if (Object.prototype.hasOwnProperty.call(init, key)) pointerInit[key] = init[key];
-      }
-      pointerInit.pointerId = 1;
-      pointerInit.pointerType = "mouse";
-      pointerInit.isPrimary = true;
-      node.dispatchEvent(new PointerEvent(pointerType, pointerInit));
-    }
-    return accepted;
+    }, init)));
+  }
+
+  // Deepest node under a viewport point, like a real pointer. Falls back to
+  // `document` when nothing is hit-testable there.
+  function nodeAtPoint(x, y) {
+    return (document.elementFromPoint && document.elementFromPoint(x, y)) || document;
   }
 
   function pilotSleep(ms) {
@@ -744,19 +742,29 @@
     var pressTarget = source;
     if (document.elementFromPoint) {
       var atPoint = document.elementFromPoint(startX, startY);
-      if (atPoint) pressTarget = atPoint;
+      // Only a hit inside the source counts. A toast, backdrop or any overlay
+      // covering the start point would otherwise take the press, the source
+      // would never move, and `drag` would still report ok — the exact false
+      // green this action exists to remove.
+      if (atPoint && (atPoint === source || source.contains(atPoint))) pressTarget = atPoint;
     }
 
-    dispatchPointerPair(pressTarget, "mousedown", "pointerdown", startX, startY, 1);
+    dispatchGesturePair(pressTarget, "pointerdown", "mousedown", startX, startY, 1);
     source.dispatchEvent(new DragEvent("dragstart", { clientX: startX, clientY: startY, dataTransfer: dt, bubbles: true }));
 
-    // Moves go to `document`: libraries attach their move listeners there once the
-    // press is seen, and a `position: fixed` ancestor can otherwise break capture.
+    // Each move targets the node under the point. Dispatching on `document`
+    // instead would give the event a propagation path of `[window, document]`
+    // and nothing else, so any listener on an element between the pressed node
+    // and the document never fires — React 17+ delegates on its root container,
+    // not on `document`. Hit-testing costs one lookup per step and still reaches
+    // the document-level listeners libraries install, because these bubble.
     for (var i = 1; i <= steps; i++) {
       var moveX = startX + ((endX - startX) * i) / steps;
       var moveY = startY + ((endY - startY) * i) / steps;
-      dispatchPointerPair(document, "mousemove", "pointermove", moveX, moveY, 1);
-      if (stepDelay > 0) await pilotSleep(stepDelay);
+      dispatchGesturePair(nodeAtPoint(moveX, moveY), "pointermove", "mousemove", moveX, moveY, 1);
+      // The delay spaces the moves apart, so after the last one it separates
+      // nothing and only pushes the drop sequence back.
+      if (stepDelay > 0 && i < steps) await pilotSleep(stepDelay);
     }
 
     source.dispatchEvent(new DragEvent("dragleave", { clientX: endX, clientY: endY, dataTransfer: dt, bubbles: true }));
@@ -768,7 +776,7 @@
     );
     source.dispatchEvent(new DragEvent("dragend", { clientX: endX, clientY: endY, dataTransfer: dt, bubbles: true }));
 
-    dispatchPointerPair(document, "mouseup", "pointerup", endX, endY, 0);
+    dispatchGesturePair(nodeAtPoint(endX, endY), "pointerup", "mouseup", endX, endY, 0);
 
     // Library drops commonly run async work (state update, request, re-render), so
     // give it a beat before the caller asserts on the DOM.

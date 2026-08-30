@@ -98,7 +98,7 @@ Three target formats, auto-detected:
 | `drop <target> --file <path>` | `drop @e3 --file ./img.png` |
 
 `drag` emits an HTML5 drag sequence *and* a real press → interpolated
-`mousemove`/`pointermove` stream on `document` → release, so it drives both native
+`pointermove`/`mousemove` stream → release, so it drives both native
 `draggable="true"` handlers and libraries like dnd-kit or sortable.js. Its `ok`
 means the gesture was delivered, not that the app reacted — assert the expected
 effect afterwards.

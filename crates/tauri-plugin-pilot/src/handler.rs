@@ -57,6 +57,30 @@ fn bridge_eval_timeout(params: Option<&serde_json::Value>) -> Duration {
     Duration::from_millis(timeout_ms.saturating_add(BRIDGE_TIMEOUT_BUFFER_MS))
 }
 
+/// Compute the Rust-side eval timeout for `drag`, whose JS implementation
+/// awaits its own timers: `steps` moves spaced by `stepDelayMs`, then a
+/// `settleMs` pause after the release. Defaults and the `steps` clamp mirror
+/// `drag()` in `bridge.js`. Without this, a caller tuning the gesture past
+/// [`DEFAULT_TIMEOUT`] gets an RPC timeout while the bridge is still mid-drag,
+/// and the pending result is dropped.
+fn drag_eval_timeout(params: Option<&serde_json::Value>) -> Duration {
+    // Anything that isn't a non-negative integer (string, float, negative)
+    // falls back to the bridge default: over-estimating the budget only costs
+    // headroom the caller never pays unless JS is genuinely stuck.
+    let field = |key: &str, default: u64| {
+        params
+            .and_then(|p| p.get(key))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(default)
+    };
+    let steps = field("steps", 12).clamp(1, 60);
+    let gesture_ms = steps
+        .saturating_mul(field("stepDelayMs", 16))
+        .saturating_add(field("settleMs", 250))
+        .saturating_add(BRIDGE_TIMEOUT_BUFFER_MS);
+    Duration::from_millis(gesture_ms).max(DEFAULT_TIMEOUT)
+}
+
 /// Extract and remove the optional `"window"` key from params.
 ///
 /// Returns `(window_label, cleaned_params)`:
@@ -151,10 +175,24 @@ pub(crate) async fn dispatch(
                 .to_owned(),
             data: None,
         }),
-        "click" | "fill" | "type" | "select" | "check" | "scroll" | "drag" | "drop" | "text"
-        | "html" | "value" | "attrs" | "eval" | "ipc" | "navigate" | "url" | "title"
-        | "visible" | "count" | "checked" => {
+        "click" | "fill" | "type" | "select" | "check" | "scroll" | "drop" | "text" | "html"
+        | "value" | "attrs" | "eval" | "ipc" | "navigate" | "url" | "title" | "visible"
+        | "count" | "checked" => {
             handle_eval_method(method, params, engine, eval_fn, win, DEFAULT_TIMEOUT).await
+        }
+        // `drag` spends `steps × stepDelayMs + settleMs` in JS timers before it
+        // resolves, so the channel timeout has to cover the gesture the caller
+        // asked for.
+        "drag" => {
+            handle_eval_method(
+                method,
+                params,
+                engine,
+                eval_fn,
+                win,
+                drag_eval_timeout(params),
+            )
+            .await
         }
         // `state` is a bridge-derived method (url/title/ready), but the dispatch
         // merges the plugin's compile-time version into the result so a single
@@ -1356,6 +1394,50 @@ mod tests {
             got,
             Duration::from_millis(DEFAULT_BRIDGE_TIMEOUT_MS + BRIDGE_TIMEOUT_BUFFER_MS)
         );
+    }
+
+    // ─── drag_eval_timeout ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_drag_eval_timeout_covers_a_tuned_gesture() {
+        // 60 moves 500 ms apart plus a 5 s settle is 35 s of JS timers. The old
+        // flat 10 s channel expired mid-drag and dropped the pending result.
+        let params = json!({"steps": 60, "stepDelayMs": 500, "settleMs": 5_000});
+        let got = drag_eval_timeout(Some(&params));
+        assert_eq!(
+            got,
+            Duration::from_millis(60 * 500 + 5_000 + BRIDGE_TIMEOUT_BUFFER_MS)
+        );
+    }
+
+    #[test]
+    fn test_drag_eval_timeout_keeps_the_default_floor() {
+        // A default or fast gesture computes well under DEFAULT_TIMEOUT; the
+        // channel must not shrink below it, since the bridge still has to
+        // resolve elements and dispatch before the timers even start.
+        assert_eq!(drag_eval_timeout(None), DEFAULT_TIMEOUT);
+        let fast = json!({"steps": 2, "stepDelayMs": 0, "settleMs": 0});
+        assert_eq!(drag_eval_timeout(Some(&fast)), DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn test_drag_eval_timeout_clamps_steps_like_the_bridge() {
+        // The bridge clamps steps to 1..=60, so a hostile count must not inflate
+        // the channel timeout past what the gesture can actually take.
+        let params = json!({"steps": 100_000, "stepDelayMs": 1_000, "settleMs": 0});
+        let got = drag_eval_timeout(Some(&params));
+        assert_eq!(
+            got,
+            Duration::from_millis(60 * 1_000 + BRIDGE_TIMEOUT_BUFFER_MS)
+        );
+    }
+
+    #[test]
+    fn test_drag_eval_timeout_ignores_hostile_values() {
+        // Non-numeric or negative tunables fall back to the bridge defaults
+        // instead of panicking or coercing to something absurd.
+        let params = json!({"steps": "lots", "stepDelayMs": -5, "settleMs": null});
+        assert_eq!(drag_eval_timeout(Some(&params)), DEFAULT_TIMEOUT);
     }
 
     #[test]

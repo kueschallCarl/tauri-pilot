@@ -1,4 +1,4 @@
-// Dependency-free behavioural tests for the bridge `drag` action (#130, #141).
+// Dependency-free behavioural tests for the bridge `drag` action (#130).
 //
 // bridge.js is an IIFE that attaches its API to `window.__PILOT__`. We load the
 // *real* file into a minimal global mock so these tests exercise the shipping
@@ -10,7 +10,7 @@
 // The bridge must scroll the source into view first, like a user would, and name
 // the viewport in the residual error.
 //
-// #141 is about what the gesture actually contains. HTML5 DragEvents alone drive
+// The gesture's contents matter just as much. HTML5 DragEvents alone drive
 // only `draggable="true"` handlers; JS drag libraries (dnd-kit, sortable.js,
 // interact.js, react-dnd's mouse backend) activate on mousedown and then track
 // repeated mousemove/pointermove on `document` before committing on mouseup. The
@@ -50,11 +50,16 @@ function rect(left, top, width, height) {
 // Element mock recording dispatched events and scrollIntoView calls. When
 // `visibleRect` is given, scrollIntoView swaps the rect to it, simulating the
 // element entering the viewport.
-function makeElement(initialRect, { visibleRect, cancelDrop = false } = {}) {
+function makeElement(initialRect, { visibleRect, cancelDrop = false, descendants = [] } = {}) {
   return {
     _rect: initialRect,
     dispatched: [],
     scrollCalls: [],
+    // The press target is gated on containment, so the mock needs the real
+    // Node.contains() semantics: an element contains itself and its subtree.
+    contains(node) {
+      return node === this || descendants.includes(node);
+    },
     getBoundingClientRect() {
       return this._rect;
     },
@@ -165,7 +170,8 @@ test("drag with offset scrolls a below-fold source into view before resolving th
   });
   // The drop point must come from the post-scroll rect, not the stale one. The
   // second lookup is the press target (deepest node under the start point).
-  assert.deepEqual(fromPointCalls, [
+  // Moves hit-test too, so only the leading pair is the drop point + press target.
+  assert.deepEqual(fromPointCalls.slice(0, 2), [
     { x: 240, y: 350 },
     { x: 110, y: 350 },
   ]);
@@ -204,7 +210,7 @@ test("drag with offset does not scroll a fully visible source", async () => {
 
   assert.equal(result.ok, true);
   assert.equal(source.scrollCalls.length, 0);
-  assert.deepEqual(fromPointCalls, [
+  assert.deepEqual(fromPointCalls.slice(0, 2), [
     { x: 240, y: 110 },
     { x: 110, y: 110 },
   ]);
@@ -225,7 +231,7 @@ test("drag with offset does not scroll a source wider than the viewport when its
 
   assert.equal(result.ok, true);
   assert.equal(source.scrollCalls.length, 0);
-  assert.deepEqual(fromPointCalls, [
+  assert.deepEqual(fromPointCalls.slice(0, 2), [
     { x: 530, y: 110 },
     { x: 400, y: 110 },
   ]);
@@ -277,7 +283,8 @@ test("drag with offset echoes a defaulted axis as 0 in the error, not undefined"
 test("drag to a target element never scrolls and resolves only the press target", async () => {
   // Both elements below the fold: the target path dispatches directly on the
   // resolved elements, so it works without scrolling and must stay that way.
-  // The single elementFromPoint call is the press target, not the drop point.
+  // The first elementFromPoint call is the press target, not the drop point;
+  // the rest are the per-move hit tests.
   const source = makeElement(rect(100, 1500, 20, 20));
   const target = makeElement(rect(400, 1600, 100, 100));
   const { pilot, fromPointCalls } = loadBridge({
@@ -293,11 +300,11 @@ test("drag to a target element never scrolls and resolves only the press target"
   assert.equal(result.ok, true);
   assert.equal(source.scrollCalls.length, 0);
   assert.equal(target.scrollCalls.length, 0);
-  assert.deepEqual(fromPointCalls, [{ x: 110, y: 1510 }]);
+  assert.deepEqual(fromPointCalls[0], { x: 110, y: 1510 });
   assert.ok(target.dispatched.some((e) => e.type === "drop"));
 });
 
-// ── #141: the gesture must also drive JS drag libraries ──────────────────────
+// ── the gesture must also drive JS drag libraries ────────────────────────────
 
 test("drag presses, streams moves on document, and releases", async () => {
   const source = makeElement(rect(0, 0, 100, 100));
@@ -313,8 +320,11 @@ test("drag presses, streams moves on document, and releases", async () => {
   const docTypes = types(doc);
   assert.deepEqual(docTypes.filter((t) => t === "mousemove").length, 4);
   assert.deepEqual(docTypes.filter((t) => t === "pointermove").length, 4);
-  assert.equal(docTypes.at(-2), "mouseup");
-  assert.equal(docTypes.at(-1), "pointerup");
+  // Pointer events lead, their compatibility mouse events follow — the order a
+  // browser produces, and the one `click()` already uses.
+  assert.deepEqual(docTypes.slice(0, 2), ["pointermove", "mousemove"]);
+  assert.equal(docTypes.at(-2), "pointerup");
+  assert.equal(docTypes.at(-1), "mouseup");
   assert.ok(
     docTypes.indexOf("mousemove") < docTypes.indexOf("mouseup"),
     "moves precede the release",
@@ -335,9 +345,9 @@ test("drag presses, streams moves on document, and releases", async () => {
 test("drag presses the deepest node under the point, not the resolved container", async () => {
   // dnd-kit and friends attach listeners to an inner handle/card; events only
   // bubble upward, so pressing the container never reaches them.
-  const source = makeElement(rect(0, 0, 100, 100));
-  const target = makeElement(rect(200, 200, 100, 100));
   const handle = makeElement(rect(40, 40, 20, 20));
+  const source = makeElement(rect(0, 0, 100, 100), { descendants: [handle] });
+  const target = makeElement(rect(200, 200, 100, 100));
   const { pilot } = loadBridge({
     elements: { "#a": source, "#b": target },
     elementFromPoint: () => handle,
@@ -345,10 +355,28 @@ test("drag presses the deepest node under the point, not the resolved container"
 
   await pilot.drag({ source: { selector: "#a" }, target: { selector: "#b" }, ...FAST });
 
-  assert.deepEqual(types(handle), ["mousedown", "pointerdown"]);
+  assert.deepEqual(types(handle).slice(0, 2), ["pointerdown", "mousedown"]);
   assert.ok(!types(source).includes("mousedown"), "container is not pressed directly");
   // The HTML5 sequence still belongs to the resolved source element.
   assert.ok(types(source).includes("dragstart"));
+});
+
+test("drag ignores an overlay covering the start point and presses the source", async () => {
+  // A toast, backdrop or modal over the source is what elementFromPoint returns.
+  // Pressing it would send the gesture somewhere unrelated while `drag` still
+  // reported ok — the false green this action exists to remove.
+  const source = makeElement(rect(0, 0, 100, 100));
+  const target = makeElement(rect(200, 200, 100, 100));
+  const overlay = makeElement(rect(0, 0, 800, 700));
+  const { pilot } = loadBridge({
+    elements: { "#a": source, "#b": target },
+    elementFromPoint: () => overlay,
+  });
+
+  await pilot.drag({ source: { selector: "#a" }, target: { selector: "#b" }, ...FAST });
+
+  assert.ok(!types(overlay).includes("pointerdown"), "overlay is not pressed");
+  assert.deepEqual(types(source).slice(0, 2), ["pointerdown", "mousedown"]);
 });
 
 test("drag falls back to the resolved source when nothing is hit-testable", async () => {
@@ -361,7 +389,7 @@ test("drag falls back to the resolved source when nothing is hit-testable", asyn
 
   await pilot.drag({ source: { selector: "#a" }, target: { selector: "#b" }, ...FAST });
 
-  assert.ok(types(source).includes("mousedown"));
+  assert.deepEqual(types(source).slice(0, 2), ["pointerdown", "mousedown"]);
 });
 
 test("drag still emits the full HTML5 sequence in order", async () => {
@@ -405,7 +433,12 @@ test("drag reports whether an HTML5 handler claimed the drop", async () => {
   assert.equal(handled.html5DropHandled, true);
 });
 
-test("drag degrades to mouse-only events when PointerEvent is unavailable", async () => {
+test("drag still emits pointer-typed events when the PointerEvent constructor is missing", async () => {
+  // A WebView without `PointerEvent` must not silently lose the pointer stream:
+  // dnd-kit's default sensor is PointerSensor, so mouse events alone would leave
+  // the very libraries this gesture targets unable to activate. Listeners
+  // dispatch by type string, so a MouseEvent typed `pointermove` still reaches
+  // an addEventListener("pointermove", …).
   const source = makeElement(rect(0, 0, 100, 100));
   const target = makeElement(rect(200, 200, 100, 100));
   const { pilot, document: doc } = loadBridge({
@@ -421,8 +454,12 @@ test("drag degrades to mouse-only events when PointerEvent is unavailable", asyn
   });
 
   assert.equal(result.ok, true);
-  assert.ok(!types(doc).some((t) => t.startsWith("pointer")), "no pointer events emitted");
+  assert.equal(types(doc).filter((t) => t === "pointermove").length, 2);
   assert.equal(types(doc).filter((t) => t === "mousemove").length, 2);
+  const pointerMove = doc.dispatched.find((e) => e.type === "pointermove");
+  assert.ok(pointerMove instanceof MouseEvent, "falls back to a MouseEvent, not a throw");
+  assert.equal(pointerMove.pointerId, 1);
+  assert.equal(pointerMove.pointerType, "mouse");
 });
 
 test("drag clamps a hostile or missing step count", async () => {
@@ -467,6 +504,27 @@ test("drag reports the gesture endpoints it used", async () => {
 
   assert.deepEqual(result.from, { x: 50, y: 50 });
   assert.deepEqual(result.to, { x: 250, y: 350 });
+});
+
+test("drag does not pay a step delay after the last move", async () => {
+  // The delay spaces moves apart, so N moves need N-1 gaps. Sleeping after the
+  // last one only pushes the drop sequence back for nothing.
+  const source = makeElement(rect(0, 0, 100, 100));
+  const target = makeElement(rect(200, 200, 100, 100));
+  const { pilot } = loadBridge({ elements: { "#a": source, "#b": target } });
+
+  const started = Date.now();
+  await pilot.drag({
+    source: { selector: "#a" },
+    target: { selector: "#b" },
+    steps: 3,
+    stepDelayMs: 100,
+    settleMs: 0,
+  });
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed >= 200, `three moves need two gaps, got ${elapsed}ms`);
+  assert.ok(elapsed < 300, `a fourth gap was paid after the last move (${elapsed}ms)`);
 });
 
 test("drag waits between moves and settles after the release by default", async () => {
